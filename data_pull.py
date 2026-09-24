@@ -142,6 +142,21 @@ def today_ist_str() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d")
 
 
+# Metabase's display formats ("August 7, 2026" / "August 7, 2026, 1:36 PM").
+# Parsed with strptime first because pd.to_datetime re-guesses the format on
+# every single-string call (~1ms each); anything that doesn't match exactly
+# falls through to the pd.to_datetime path below, so results are unchanged.
+_FAST_DATE_FMT = "%B %d, %Y"
+_FAST_DATETIME_FMT = "%B %d, %Y, %I:%M %p"
+
+
+def _strptime_or_none(s: str, fmt: str):
+    try:
+        return datetime.strptime(s, fmt)
+    except ValueError:
+        return None
+
+
 def normalize_date(v):
     """Returns 'yyyy-mm-dd' string, or '' — same as your reference version."""
     if v is None or (isinstance(v, float) and pd.isna(v)) or v == "":
@@ -156,6 +171,9 @@ def normalize_date(v):
     if m:
         # assumes dd/mm/yyyy, exactly like your reference normalizeDate_()
         return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+    fast = _strptime_or_none(s, _FAST_DATE_FMT)
+    if fast is not None:
+        return fast.strftime("%Y-%m-%d")
     try:
         d = pd.to_datetime(s, errors="coerce")
         if pd.isna(d):
@@ -174,6 +192,10 @@ def normalize_datetime_ist(v):
     """
     if v is None or (isinstance(v, float) and pd.isna(v)) or v == "":
         return ""
+    if isinstance(v, str):
+        fast = _strptime_or_none(v, _FAST_DATETIME_FMT)
+        if fast is not None:
+            return fast.replace(tzinfo=IST).strftime("%Y-%m-%d %H:%M:%S")
     try:
         d = pd.to_datetime(v, errors="coerce")
         if pd.isna(d):
@@ -310,17 +332,33 @@ def apply_end_date_flags(df: pd.DataFrame, end_date: str) -> pd.DataFrame:
     Recomputes fu_due_date_today / fu_completedat_today against `end_date`
     instead of the SQL's now().
 
-    The card's own SQL derives these two flags from the database clock
-    (now() in Asia/Kolkata), while every other "today" in the card
-    (snapshot_date, funnel_bucket, overdue_days, followup_due_date) is the
-    end_date filter. Whenever end_date isn't the day the query ran, the two
-    disagree. Here the flags are rebuilt from the per-follow-up dates already
-    in the result, so the whole dashboard uses a single "today" -- end_date.
+    The card's own SQL used to derive these two flags from the database
+    clock (now() in Asia/Kolkata), while every other "today" in the card
+    (snapshot_date, funnel_bucket, overdue_days, followup_due_date) was the
+    end_date filter. Whenever end_date wasn't the day the query ran, the two
+    disagreed. Here the flags are rebuilt from the per-follow-up dates
+    already in the result, so the whole dashboard uses a single "today" --
+    end_date. (The card's own SQL has since been updated to use
+    {{end_date}} directly too -- see followup_dashboard_query.sql's
+    fu_pivot CTE -- so this recomputation is now belt-and-braces for
+    fu_completedat_today specifically, but still load-bearing for
+    fu_due_date_today, per the FIX below.)
 
-    Same rule as the SQL: 1 if ANY of FU1..FU6 has that date as its
-    due date / completion date (a lead's 7th+ follow-up is not looked at,
-    exactly like the SQL). Expects normalised 'yyyy-mm-dd' date strings
-    (i.e. run after normalize_dataframe). Returns a new DataFrame.
+    fu_due_date_today: 1 if ANY of FU1..FU6 has that date as its due date,
+    OR followup_due_date == end_date. **[FIX]** -- this used to check only
+    FU1..FU6, matching the SQL's old rule; a lead with zero real follow-up
+    tasks has no FU1..FU6 due date to check at all, so it could never be
+    flagged as due today no matter what end_date was picked, even though
+    followup_due_date (its own COALESCE fallback to
+    first_meeting_done_date + 2) clearly places it there. Mirrors the same
+    OR-condition added to the SQL's own fu_due_date_today.
+
+    fu_completedat_today: 1 if ANY of FU1..FU6 has that date as its
+    completion date (a lead's 7th+ follow-up is not looked at, exactly
+    like the SQL -- unchanged).
+
+    Expects normalised 'yyyy-mm-dd' date strings (i.e. run after
+    normalize_dataframe). Returns a new DataFrame.
     """
     out = df.copy()
     end = normalize_date(end_date)
@@ -329,9 +367,26 @@ def apply_end_date_flags(df: pd.DataFrame, end_date: str) -> pd.DataFrame:
 
     for flag, suffix in (("fu_due_date_today", "due_date"), ("fu_completedat_today", "completed_at")):
         cols = [f"fu{i}_{suffix}" for i in range(1, 7) if f"fu{i}_{suffix}" in out.columns]
+        if flag == "fu_due_date_today" and "followup_due_date" in out.columns:
+            cols = cols + ["followup_due_date"]
         if cols:
             out[flag] = (out[cols] == end).any(axis=1).astype(float)
     return out
+
+
+def _map_unique(s: pd.Series, fn) -> pd.Series:
+    """
+    Same result as s.map(fn) for a pure fn, but calls fn once per distinct
+    value instead of once per row. Date columns repeat the same few hundred
+    strings across ~20k rows, and a non-ISO date string makes fn fall back to
+    a slow pd.to_datetime call -- this cut normalize_dataframe from ~70s to a
+    few seconds on the dashboard CSV. Missing values (None/NaN) are mapped via
+    fn(None), which every caller here treats the same as NaN.
+    """
+    codes, uniques = pd.factorize(s)
+    mapped = [fn(u) for u in uniques]
+    missing = fn(None)
+    return pd.Series([mapped[c] if c >= 0 else missing for c in codes], index=s.index)
 
 
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -344,9 +399,9 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in out.columns:
         if col in DATE_ONLY_COLUMNS:
-            out[col] = out[col].map(normalize_date)
+            out[col] = _map_unique(out[col], normalize_date)
         elif col in DATETIME_IST_COLUMNS:
-            out[col] = out[col].map(normalize_datetime_ist)
+            out[col] = _map_unique(out[col], normalize_datetime_ist)
         elif col in BOOL_COLUMNS:
             out[col] = out[col].map(to_bool).astype("boolean")  # pandas nullable bool
         elif col in NUMERIC_COLUMNS:

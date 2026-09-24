@@ -6,13 +6,15 @@ FollowUp Dashboard — Streamlit build.
 Run with:
     streamlit run app.py
 
-Data: loads straight from the CSV produced by data_pull.py (default:
-followup_dashboard.csv in this same folder, re-normalised so dtypes survive
-the CSV round-trip). No live fetch -- the dashboard only ever shows this
-file's snapshot.
+Data: a static snapshot. The dashboard loads followup_dashboard.csv (the file
+produced by data_pull.py, in this same folder, re-normalised so dtypes
+survive the CSV round-trip) and nothing else -- no live Metabase pull, no
+date pickers, no background refresh. To update the numbers, regenerate the
+CSV and redeploy. See logics.md §8.
 
-Every "today" in the dashboard is the data's end date (its snapshot_date)
--- see data_pull.apply_end_date_flags -- never the server clock.
+Every "today" in the dashboard is the data's end date (the CSV's
+snapshot_date) -- see data_pull.apply_end_date_flags -- never the server
+clock.
 
 The person can pick a city/cluster from the sidebar (or "Pan-India" for every cluster
 combined -- no Python-level hardcoding of which city is shown), and
@@ -45,7 +47,7 @@ PAN_INDIA = "Pan-India"  # the sidebar's "no cluster filter -- every city combin
 # Data loading
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Loading data...", ttl=6600)
+@st.cache_data(show_spinner="Loading data...")
 def load_data(csv_path: str) -> pd.DataFrame:
     """
     Reads everything as string first (keep_default_na=False keeps blanks as
@@ -53,14 +55,9 @@ def load_data(csv_path: str) -> pd.DataFrame:
     what decides the dtype, rather than pandas' own CSV type inference —
     exactly the same approach data_pull.py's tests were verified against.
 
-    ttl=6600 (1h50m) is a safety net for the hosted deployment: the CSV is
-    meant to be refreshed every 2 hours by a scheduled job (see
-    .github/workflows/refresh_data.yml) that commits the new file and lets
-    Streamlit Cloud's auto-redeploy-on-push pick it up, which already clears
-    this cache by restarting the process -- this ttl just re-reads the file
-    from disk on its own if a redeploy is ever delayed or disabled, staying
-    a bit shorter than the 2-hour refresh cadence so it never masks a
-    fresh commit.
+    Cached for the life of the process (one read shared by every session);
+    pushing a new CSV redeploys the app, which restarts the process and
+    clears the cache.
     """
     raw = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
     df = normalize_dataframe(raw)
@@ -85,6 +82,11 @@ def csv_snapshot_date(df: pd.DataFrame) -> str:
 
 def fmt_pct(x: float) -> str:
     return f"{x:.1f}%"
+
+
+def fmt_pct_int(x: float) -> str:
+    """Whole-percent formatting -- used only where a section asked for no decimal (Due Today, Overdue)."""
+    return f"{x:.0f}%"
 
 
 def render_ageing_tile(container, value: int, pct: float, label: str, color: str) -> None:
@@ -625,8 +627,7 @@ def build_funnel_quality_tlwise_display(tlw: pd.DataFrame) -> pd.DataFrame:
 # Data source: CSV snapshot only
 # ---------------------------------------------------------------------------
 #
-# st.session_state.data is what the whole page renders:
-#     {"df", "source" ("csv"), "end_date"}
+# st.session_state.data is what the whole page renders: {"df", "end_date"},
 # or None if the CSV wasn't found.
 
 def _init_data_state() -> None:
@@ -638,7 +639,7 @@ def _init_data_state() -> None:
     except FileNotFoundError:
         st.session_state.data = None
         return
-    st.session_state.data = {"df": df, "source": "csv", "end_date": csv_snapshot_date(df)}
+    st.session_state.data = {"df": df, "end_date": csv_snapshot_date(df)}
 
 
 def _render_data_card() -> None:
@@ -872,6 +873,11 @@ st.markdown(
     .page-caption {
         color: #64748B;
         font-size: 0.9rem;
+        margin-bottom: 0.3rem;
+    }
+    .page-updated {
+        color: #94A3B8;
+        font-size: 0.8rem;
         margin-bottom: 1.5rem;
     }
 
@@ -1131,7 +1137,7 @@ st.markdown(
 )
 
 _init_data_state()
-data = st.session_state.data  # None only if there is no CSV and the first live pull hasn't finished
+data = st.session_state.data  # None only if the CSV file is missing
 df_all = data["df"] if data is not None else pd.DataFrame()
 
 # Cities driven entirely by the data (every distinct `cluster` value
@@ -1221,10 +1227,14 @@ if not IS_PAN_INDIA:
 if as_of:
     page_caption_bits.append(f"as of {as_of}")
 page_caption_bits.append("CSV snapshot")
+
+last_updated_text = f"Dashboard last updated: {as_of}" if as_of else "Dashboard last updated: unknown"
+
 st.markdown(
     f'<div class="page-eyebrow">{page_eyebrow}</div>'
     f'<div class="page-title">{page_display_name}</div>'
-    f'<div class="page-caption">{" · ".join(page_caption_bits)}</div>',
+    f'<div class="page-caption">{" · ".join(page_caption_bits)}</div>'
+    f'<div class="page-updated">{last_updated_text}</div>',
     unsafe_allow_html=True,
 )
 
@@ -1286,7 +1296,7 @@ with st.container(border=True):
     ai = M.audio_index_summary(city_df)
 
     if ai["total_denominator"] == 0:
-        st.info("No non-on-spot meetings for this cluster to compute the Audio Index against.")
+        st.info("No meetings with a blank order_closure_datetime_ist for this cluster to compute the Audio Index against.")
     else:
         # Hero layout: Audio Index is the headline (big, left), with
         # Coverage % and Completeness % as smaller supporting figures
@@ -1304,14 +1314,14 @@ with st.container(border=True):
                 <div>
                   <div class="ai-hero-sec-label">
                     Coverage %
-                    <span class="ai-hero-help-sm" title="Represents the percentage of not-on-spot meetings that are eligible for follow-ups (Meeting Done - Closed on Follow-Up - No audio notes - Closed on spot)">?</span>
+                    <span class="ai-hero-help-sm" title="Eligible for follow-ups leads, over all meetings with a blank order_closure_datetime_ist (irrespective of Closed on spot / Closed on Follow-Up)">?</span>
                   </div>
                   <div class="ai-hero-sec-value">{fmt_pct(ai["coverage_pct"])}</div>
                 </div>
                 <div>
                   <div class="ai-hero-sec-label">
                     Completeness %
-                    <span class="ai-hero-help-sm" title="Share of all {M.TOTAL_DISPOSITIONS} disposition slots, across leads eligible for follow-ups">?</span>
+                    <span class="ai-hero-help-sm" title="Share of all {M.TOTAL_DISPOSITIONS} disposition slots, across all meetings with a blank order_closure_datetime_ist (Eligible for follow-ups + No audio notes)">?</span>
                   </div>
                   <div class="ai-hero-sec-value">{fmt_pct(ai["completeness_pct"])}</div>
                 </div>
@@ -1419,17 +1429,23 @@ st.divider()
 with st.container(border=True):
     st.header("Due Today")
 
+    due_today_corpus = M.due_today_corpus_pool(city_df)
     dts = M.due_today_summary(city_df)
 
-    if dts["total_came_due"] == 0:
-        st.info("No follow-ups came due today for this cluster.")
+    if due_today_corpus.empty:
+        st.info("No leads are eligible for follow-ups for this cluster.")
     else:
+        # dts["total_came_due"] can legitimately be 0 here (an eligible lead
+        # exists for every TL/SC, but none happen to be due today) -- the
+        # cards and TL/SC table below still render, all zeros, rather than
+        # this section disappearing entirely.
         st.metric(
             "Due Today / Worked Today / Booked",
             f"{dts['total_came_due']:,}/{dts['completed_count']:,}/{dts['booked_count']:,}",
-            help="Due Today: leads with fu_due_date_today=1. Worked Today: of those, "
-                 "fu_completedat_today=1. Booked: of Worked Today, order_closure_datetime_ist "
-                 "is filled in.",
+            help="Due Today: leads in the Eligible for follow-ups pool (same corpus as the "
+                 "Overview section) with fu_due_date_today=1. Worked Today: of those, "
+                 "fu_completedat_today=1. Booked: of Due Today (independent of Worked, not "
+                 "nested inside it), order_closure_datetime_ist is filled in.",
         )
         if not IS_PAN_INDIA:
             top_tl_note = (
@@ -1442,15 +1458,17 @@ with st.container(border=True):
         cat1.metric(
             "Agreed to Meet + Another follow-up",
             f"{dts['agreed_another']:,}/{dts['agreed_another_completed']:,}/{dts['agreed_another_booked']:,}",
-            help="Due today / Worked today / Booked, for leads with this outcome.",
+            help="Due today / Worked today / Booked, for leads with this outcome -- Booked is "
+                 "independent of Worked, not nested inside it.",
         )
-        cat1.caption(f"{dts['agreed_another_pct']:.1f}%")
+        cat1.caption(fmt_pct_int(dts['agreed_another_pct']))
         cat2.metric(
             "P1 + P2",
             f"{dts['p1p2']:,}/{dts['p1p2_completed']:,}/{dts['p1p2_booked']:,}",
-            help="Due today / Worked today / Booked, for leads with priority P1 or P2.",
+            help="Due today / Worked today / Booked, for leads with priority P1 or P2 -- "
+                 "Booked is independent of Worked, not nested inside it.",
         )
-        cat2.caption(f"{dts['p1p2_pct']:.1f}%")
+        cat2.caption(fmt_pct_int(dts['p1p2_pct']))
         cat3.metric(
             "Others",
             f"{dts['others']:,}/{dts['others_completed']:,}/{dts['others_booked']:,}",
@@ -1459,9 +1477,9 @@ with st.container(border=True):
                  "subtracted from the top box (a lead in both other boxes means the three "
                  "boxes' totals can add up to more than the top box's).",
         )
-        cat3.caption(f"{dts['others_pct']:.1f}%")
+        cat3.caption(fmt_pct_int(dts['others_pct']))
 
-        came_due = M.came_due_pool(city_df)
+        came_due = M.came_due_pool(due_today_corpus)
 
         display_cols = {
             "came_due": "Due Today", "worked": "Worked", "pending": "Pending", "pct": "Worked %",
@@ -1477,15 +1495,15 @@ with st.container(border=True):
         }
 
         def _due_today_fmt(breakdown_df: pd.DataFrame) -> pd.DataFrame:
-            """Formats breakdown_by()'s raw pct float as 'X.X%' -- applied before display_cols renames it to 'Worked %'."""
+            """Formats breakdown_by()'s raw pct float as a whole-percent string -- applied before display_cols renames it to 'Worked %'."""
             d = breakdown_df.copy()
-            d["pct"] = d["pct"].map(lambda x: f"{x:.1f}%")
+            d["pct"] = d["pct"].map(fmt_pct_int)
             return d
 
         if IS_PAN_INDIA:
             # ---- Pan-India: flat City view, no further drill ----
             with st.expander("🔽 Due Today — City breakdown"):
-                cityb = M.breakdown_by(came_due, "cluster")
+                cityb = M.breakdown_by(due_today_corpus, "cluster")
                 cityb_display = _due_today_fmt(cityb).rename(columns={"cluster": "City", **display_cols})
                 cityb_styled, cityb_config = apply_table_style(cityb_display, extra_center_cols=["Worked %"])
                 st.dataframe(
@@ -1496,9 +1514,9 @@ with st.container(border=True):
         else:
             st.markdown("**TL → SC → Lead**")
             render_accordion_drill(
-                tl_df=_due_today_fmt(M.tl_breakdown(came_due)),
+                tl_df=_due_today_fmt(M.tl_breakdown(due_today_corpus)),
                 tl_id_col="tl",
-                sc_lookup=lambda tl: _due_today_fmt(M.sc_breakdown(came_due, tl)),
+                sc_lookup=lambda tl: _due_today_fmt(M.sc_breakdown(due_today_corpus, tl)),
                 sc_id_col="sc",
                 lead_lookup=lambda tl, sc: M.lead_table(came_due, tl_name=tl, sc_name=sc),
                 display_cols=display_cols,
@@ -1518,28 +1536,28 @@ st.divider()
 with st.container(border=True):
     st.header("Overdue")
 
-    ov = M.overdue_summary(city_df)
+    ov = M.overdue_summary(city_df, as_of)
 
     if ov["total_denominator"] == 0:
-        st.info("No leads are eligible for follow-ups (the Overdue % denominator) for this cluster.")
+        st.info("No leads are eligible for follow-ups for this cluster.")
     else:
-        ov_top, ov_p = st.columns([2, 2])
-        with ov_top:
-            st.metric(
-                "Overdue",
-                fmt_pct(ov["pct_overdue"]),
-                help="funnel_bucket = 'overdue' leads, over all Eligible for follow-ups leads "
-                     "(the same pool as the Overview section's Eligible for follow-ups count).",
+        st.metric(
+            "Overdue (as on today) / Worked today / Booked today",
+            f"{ov['total_overdue']:,}/{ov['completed_count']:,}/{ov['booked_count']:,}",
+            help="Overdue (as on today): funnel_bucket = 'overdue' leads, out of all Eligible "
+                 "for follow-ups leads (the same pool as the Overview section's Eligible for "
+                 "follow-ups count) -- same corpus as before, this box just replaces the old "
+                 "single Overdue % reading. Worked today: of those, last_follow_up_date equals "
+                 "today's date. Booked today: of Overdue (as on today) -- independent of "
+                 "Worked, not nested inside it -- order_closure_datetime_ist is filled in.",
+        )
+        st.caption(f"{ov['total_overdue']:,} of {ov['total_denominator']:,} eligible leads")
+        if not IS_PAN_INDIA:
+            top_tl_note = (
+                f"highest overdue: **{ov['top_overdue_tl']}** ({ov['top_overdue_count']:,})"
+                if ov["top_overdue_tl"] else "—"
             )
-            st.caption(f"{ov['total_overdue']:,} of {ov['total_denominator']:,} eligible leads")
-        with ov_p:
-            st.metric("Total overdue leads", f"{ov['total_overdue']:,}")
-            if not IS_PAN_INDIA:
-                top_tl_note = (
-                    f"highest overdue: **{ov['top_overdue_tl']}** ({ov['top_overdue_count']:,})"
-                    if ov["top_overdue_tl"] else "—"
-                )
-                st.caption(top_tl_note)
+            st.caption(top_tl_note)
 
         age1, age2, age3 = st.columns(3)
         render_ageing_tile(age1, ov["under_3_days"], ov["under_3_days_pct"], "Under 3 days", "green")
@@ -1547,9 +1565,29 @@ with st.container(border=True):
         render_ageing_tile(age3, ov["over_5_days"], ov["over_5_days_pct"], "Over 5 days", "red")
 
         ocat1, ocat2, ocat3 = st.columns(3)
-        ocat1.metric("Agreed to Meet + Another follow-up", f"{ov['agreed_another']:,}")
-        ocat2.metric("P1 + P2", f"{ov['p1p2']:,}")
-        ocat3.metric("Others", f"{ov['others']:,}")
+        ocat1.metric(
+            "Agreed to Meet + Another follow-up",
+            f"{ov['agreed_another']:,}/{ov['agreed_another_completed']:,}/{ov['agreed_another_booked']:,}",
+            help="Overdue today / Worked today / Booked today, for leads with this outcome -- "
+                 "Booked is independent of Worked, not nested inside it.",
+        )
+        ocat1.caption(fmt_pct_int(ov["agreed_another_pct"]))
+        ocat2.metric(
+            "P1 + P2",
+            f"{ov['p1p2']:,}/{ov['p1p2_completed']:,}/{ov['p1p2_booked']:,}",
+            help="Overdue today / Worked today / Booked today, for leads with priority P1 or "
+                 "P2 -- Booked is independent of Worked, not nested inside it.",
+        )
+        ocat2.caption(fmt_pct_int(ov["p1p2_pct"]))
+        ocat3.metric(
+            "Others",
+            f"{ov['others']:,}/{ov['others_completed']:,}/{ov['others_booked']:,}",
+            help="Leads with neither Agreed to Meet + Another follow-up's outcome nor a "
+                 "P1/P2 priority -- Overdue/Worked/Booked counted directly for that group, not "
+                 "subtracted from the top box (a lead in both other boxes means the three "
+                 "boxes' totals can add up to more than the top box's).",
+        )
+        ocat3.caption(fmt_pct_int(ov["others_pct"]))
 
         ov_display_cols = {
             "overdue": "Overdue", "overdue_pct": "Overdue %",
@@ -1564,12 +1602,18 @@ with st.container(border=True):
             ),
         }
 
+        def _overdue_fmt(breakdown_df: pd.DataFrame) -> pd.DataFrame:
+            """Formats overdue_breakdown_by()'s raw overdue_pct float as a whole-percent string -- applied before display_cols renames it to 'Overdue %'."""
+            d = breakdown_df.copy()
+            d["overdue_pct"] = d["overdue_pct"].map(fmt_pct_int)
+            return d
+
         if IS_PAN_INDIA:
             # ---- Pan-India: flat City view, no further drill ----
             with st.expander("🔽 Overdue — City breakdown"):
                 city_ov = M.overdue_breakdown_by(city_df, "cluster")
-                city_ov_display = city_ov.rename(columns={"cluster": "City", **ov_display_cols})
-                city_ov_styled, city_ov_config = apply_table_style(city_ov_display)
+                city_ov_display = _overdue_fmt(city_ov).rename(columns={"cluster": "City", **ov_display_cols})
+                city_ov_styled, city_ov_config = apply_table_style(city_ov_display, extra_center_cols=["Overdue %"])
                 st.dataframe(
                     city_ov_styled,
                     width="stretch", hide_index=True,
@@ -1579,9 +1623,9 @@ with st.container(border=True):
             st.markdown("**TL → SC → Lead**")
             ov_pool_all = M.overdue_pool(city_df)
             render_accordion_drill(
-                tl_df=M.tl_overdue_breakdown(city_df),
+                tl_df=_overdue_fmt(M.tl_overdue_breakdown(city_df)),
                 tl_id_col="tl",
-                sc_lookup=lambda tl: M.sc_overdue_breakdown(city_df, tl),
+                sc_lookup=lambda tl: _overdue_fmt(M.sc_overdue_breakdown(city_df, tl)),
                 sc_id_col="sc",
                 lead_lookup=lambda tl, sc: M.overdue_lead_table(ov_pool_all, tl_name=tl, sc_name=sc),
                 display_cols=ov_display_cols,
@@ -1776,10 +1820,13 @@ with st.container(border=True):
                             render_accordion_drill(
                                 tl_df=M.another_fu_tl_breakdown(box_pool, str(as_of)),
                                 tl_id_col="tl",
-                                sc_lookup=lambda tl: M.another_fu_sc_breakdown(box_pool, str(as_of), tl),
+                                # `_p=box_pool` binds THIS box's pool now. A bare `box_pool` in a lambda is looked
+                                # up when it is CALLED (a row click reruns only the accordion fragment), by which
+                                # time the expander loop has moved on and `box_pool` is the LAST box's pool.
+                                sc_lookup=lambda tl, _p=box_pool: M.another_fu_sc_breakdown(_p, str(as_of), tl),
                                 sc_id_col="sc",
-                                lead_lookup=lambda tl, sc: M.another_fu_lead_table(
-                                    box_pool, str(as_of), tl_name=tl, sc_name=sc,
+                                lead_lookup=lambda tl, sc, _p=box_pool: M.another_fu_lead_table(
+                                    _p, str(as_of), tl_name=tl, sc_name=sc,
                                 ),
                                 display_cols=affu_display_cols,
                                 group_label="TL",
@@ -1812,9 +1859,11 @@ with st.container(border=True):
                             render_accordion_drill(
                                 tl_df=M.dnp_tl_breakdown(box_pool),
                                 tl_id_col="tl",
-                                sc_lookup=lambda tl: M.dnp_sc_breakdown(box_pool, tl),
+                                # `_p=box_pool` binds THIS box's pool now -- see the note on the Another Follow up
+                                # drill-down above for why a bare `box_pool` here would go stale.
+                                sc_lookup=lambda tl, _p=box_pool: M.dnp_sc_breakdown(_p, tl),
                                 sc_id_col="sc",
-                                lead_lookup=lambda tl, sc: M.dnp_lead_table(box_pool, tl_name=tl, sc_name=sc),
+                                lead_lookup=lambda tl, sc, _p=box_pool: M.dnp_lead_table(_p, tl_name=tl, sc_name=sc),
                                 display_cols=dnp_display_cols,
                                 group_label="TL",
                                 sub_label="SC",

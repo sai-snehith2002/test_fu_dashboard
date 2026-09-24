@@ -62,13 +62,26 @@ def _followup_buckets(df: pd.DataFrame) -> dict:
       1. Closed on spot          -- is_on_spot == True
       2. Closed on Follow-Up     -- is_on_spot == False AND
                                      order_closure_datetime_ist is NOT blank
-      3. No audio notes          -- (of what's left) notes_submitted_in_range == 0
-                                     AND order_closure_datetime_ist is blank
+      3. No audio notes          -- (of what's left) audio_present is NOT
+                                     true (False or missing) AND
+                                     order_closure_datetime_ist is blank
       4. Eligible for follow-ups -- everything else in Meetings done
+
+    **[FIX]** -- bucket 3 used to be notes_submitted_in_range == 0, which a
+    blank/missing value never satisfies (pandas' `==` with NaN is always
+    False). A lead with no meeting_metrics_history row inside the pull's
+    [start_date, end_date] -- i.e. no fresh meeting in range at all -- has
+    BOTH notes_submitted_in_range and audio_present missing, so the old
+    condition silently fell through to bucket 4 (Eligible) instead of
+    bucket 3, inflating Eligible (and, downstream, Audio Index's Coverage %
+    and Overdue's whole corpus, since both now share this pool) with leads
+    that were never actually assessed for audio in this pull. Checking
+    audio_present directly (treating missing the same as False, via
+    _bool_series) catches those leads correctly.
 
     This priority ordering exists because the four conditions, read
     independently, are NOT mutually exclusive: a record with
-    is_on_spot == True, notes_submitted_in_range == 0 and
+    is_on_spot == True, audio_present not true, and
     order_closure_datetime_ist blank would satisfy both "Closed on spot"
     and "No audio notes" at the same time. Classifying by priority
     instead guarantees the four buckets partition Meetings done exactly,
@@ -87,11 +100,11 @@ def _followup_buckets(df: pd.DataFrame) -> dict:
         df.get("order_closure_datetime_ist", pd.Series("", index=df.index))
         .astype(str).str.strip() == ""
     )
-    notes_in_range = pd.to_numeric(df.get("notes_submitted_in_range"), errors="coerce")
+    audio_present = _bool_series(df, "audio_present")  # missing treated as False, like every other bool column here
 
     closed_on_spot = meetings_done & on_spot
     closed_on_followup = meetings_done & ~on_spot & ~order_closure_blank
-    no_audio_notes = meetings_done & ~on_spot & order_closure_blank & (notes_in_range == 0)
+    no_audio_notes = meetings_done & ~on_spot & order_closure_blank & ~audio_present
     eligible = meetings_done & ~closed_on_spot & ~closed_on_followup & ~no_audio_notes
 
     return {
@@ -129,7 +142,7 @@ def card1_metrics(df: pd.DataFrame) -> dict:
     - Meetings done: sc_channel == "Field Sale SC" (case-insensitive)
     - Closed on spot: is_on_spot == True
     - Closed on Follow-Up: is_on_spot == False AND order_closure_datetime_ist is not blank
-    - No audio notes: (of the rest) notes_submitted_in_range == 0 AND order_closure_datetime_ist blank
+    - No audio notes: (of the rest) audio_present is NOT true (False or missing) AND order_closure_datetime_ist blank
     - Eligible for follow-ups: Meetings done - Closed on Follow-Up - No audio Notes - Closed on spot
       (i.e. everything left in Meetings done after the three buckets above)
     """
@@ -204,8 +217,26 @@ def due_today_pool(df: pd.DataFrame) -> pd.DataFrame:
     return df[completed | came_due].copy()
 
 
+def due_today_corpus_pool(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    The Due Today section's overall lead corpus: the same "Eligible for
+    follow-ups" pool as Overview's Card 1 / Audio Index / Overdue -- see
+    eligible_for_followups_pool() / _followup_buckets(). **[FIX, major]**
+    -- this used to be the raw cluster-filtered data with no Eligible
+    restriction at all (came_due_pool was applied directly to city_df); it
+    now shares the exact same eligible-for-follow-ups pool the other three
+    sections use, so a TL/SC's roster here matches theirs too.
+    """
+    return eligible_for_followups_pool(df)
+
+
 def came_due_pool(df: pd.DataFrame) -> pd.DataFrame:
-    """Records where fu_due_date_today==1 — the base for every Due Today card."""
+    """
+    Records where fu_due_date_today==1 -- the base for every Due Today
+    card. `df` should already be due_today_corpus_pool(city_df) (or a
+    subset of it) wherever the corpus restriction matters -- see
+    due_today_corpus_pool's docstring.
+    """
     came_due = _is_one(df.get("fu_due_date_today"), df.index)
     return df[came_due].copy()
 
@@ -265,7 +296,10 @@ def due_today_summary(df: pd.DataFrame) -> dict:
     """
     df must already be cluster-filtered. Computes the Due Today section's
     headline numbers, all within the "came due today" population (see
-    came_due_pool -- fu_due_date_today == 1).
+    came_due_pool -- fu_due_date_today == 1) -- itself narrowed to the
+    Eligible-for-follow-ups corpus first (see due_today_corpus_pool).
+    **[FIX]** -- this used to filter fu_due_date_today directly on the
+    whole cluster-filtered data with no Eligible restriction.
 
     Each of the 4 summary boxes now shows a 3-part Due / Worked / Booked
     reading, all computed on the SAME population that box covers (the
@@ -273,7 +307,15 @@ def due_today_summary(df: pd.DataFrame) -> dict:
     Agreed+Another, that priority's leads for P1+P2):
       - Due:    fu_due_date_today == 1 (already true for every row here)
       - Worked: fu_completedat_today == 1
-      - Booked: (of Worked) order_closure_datetime_ist is not blank
+      - Booked: order_closure_datetime_ist is not blank, out of that SAME
+        box's Due population -- independent of Worked, not nested inside
+        it. **[FIX]** -- Booked used to be "of Worked, order_closure_datetime_ist
+        not blank" (i.e. AND'd with the Worked condition); a lead whose
+        order got closed without today's specific follow-up task being
+        marked complete (fu_completedat_today != 1) was invisible to
+        Booked even though the order was, in fact, booked. Booked is now
+        its own independent condition over Due, same relationship
+        Agreed+Another/P1+P2/Others already have to each other.
 
     Others is a genuine independent population, not a residual: every lead
     in the came-due-today pool whose last_follow_up_status is checked first
@@ -288,7 +330,7 @@ def due_today_summary(df: pd.DataFrame) -> dict:
     add up to MORE than total_came_due whenever a lead is in both
     Agreed+Another and P1+P2 -- that's expected, not a bug.
     """
-    cd = came_due_pool(df)
+    cd = came_due_pool(due_today_corpus_pool(df))
     total_came_due = len(cd)
 
     completed_mask = _is_one(cd.get("fu_completedat_today"), cd.index)
@@ -305,7 +347,7 @@ def due_today_summary(df: pd.DataFrame) -> dict:
     order_closure_filled = (
         cd.get("order_closure_datetime_ist", pd.Series("", index=cd.index)).astype(str).str.strip() != ""
     )
-    booked_count = int((completed_mask & order_closure_filled).sum())
+    booked_count = int(order_closure_filled.sum())
 
     status = cd.get("last_follow_up_status", pd.Series("", index=cd.index)).astype(str).str.strip().str.lower()
     status_mask = status.isin(AGREED_OUTCOMES)
@@ -318,16 +360,17 @@ def due_today_summary(df: pd.DataFrame) -> dict:
     # Per-outcome/per-priority "completed today" and "booked" counts,
     # against that same group's own "due today" count -- an independent
     # count per group (not a mutually-exclusive partition), same
-    # convention as before.
+    # convention as before. Booked is independent of Worked here too (see
+    # the docstring's [FIX] note) -- not AND'd with completed_mask.
     agreed_another_completed = int((status_mask & completed_mask).sum())
-    agreed_another_booked = int((status_mask & completed_mask & order_closure_filled).sum())
+    agreed_another_booked = int((status_mask & order_closure_filled).sum())
     p1p2_completed = int((priority_mask & completed_mask).sum())
-    p1p2_booked = int((priority_mask & completed_mask & order_closure_filled).sum())
+    p1p2_booked = int((priority_mask & order_closure_filled).sum())
 
     others_mask = ~status_mask & ~priority_mask
     others_due = int(others_mask.sum())
     others_completed = int((others_mask & completed_mask).sum())
-    others_booked = int((others_mask & completed_mask & order_closure_filled).sum())
+    others_booked = int((others_mask & order_closure_filled).sum())
 
     agreed_another_pct = (agreed_another_completed / agreed_another * 100) if agreed_another else 0.0
     p1p2_pct = (p1p2_completed / p1p2 * 100) if p1p2 else 0.0
@@ -361,38 +404,45 @@ def due_today_summary(df: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def breakdown_by(came_due: pd.DataFrame, group_col: str) -> pd.DataFrame:
+def breakdown_by(eligible_pool: pd.DataFrame, group_col: str) -> pd.DataFrame:
     """
     One row per TL (or per SC, depending on group_col): came due, worked,
     pending, pct, plus Agreed+Another / P1+P2 / Others -- using the SAME
     independent-count convention as due_today_summary's cards, not the
     mutually-exclusive due_today_categorize() bucketing the lead-level
-    tables use. **[FIX]** -- this used to precedence-bucket each lead into
-    exactly one of the three columns (Agreed/Another > P1/P2 > Others), so a
-    lead that qualified for both Agreed+Another and P1/P2 was only ever
-    counted under Agreed+Another here. That made a column's sum across
-    every TL (or every SC) disagree with the summary card's own total for
-    that same column. Now, for a group's rows:
+    tables use.
+
+    `eligible_pool` is the Due Today section's overall corpus (see
+    due_today_corpus_pool) -- NOT pre-filtered to fu_due_date_today==1.
+    Every TL/SC present anywhere in this corpus gets a row, even one with
+    zero due-today leads (all its numeric columns are then 0). **[FIX]**
+    -- this used to take the already came_due-filtered pool directly, so a
+    TL/SC with no lead due today was silently absent from the table
+    entirely rather than showing a 0 row.
+
+    For a group's rows (computed only from that group's came_due subset --
+    see came_due_pool):
       - Agreed + Another / P1+P2 / Others: all three are independent
         per-lead conditions (Others = ~Agreed+Another AND ~P1+P2, checked
         against status first, then priority for what's left -- same as
-        due_today_summary's cards), each summed via groupby. **[FIX]** --
-        Others used to be a residual (came_due count minus Agreed+Another
-        minus P1+P2), which double-subtracted a lead that was both
-        (undercounting Others for that overlap); now it's counted directly
-        like the other two. Because all three are independent, a row's
-        Agreed+Another + P1+P2 + Others can add up to more than its own
-        came_due whenever a lead is in both Agreed+Another and P1+P2 --
-        that's expected, not a bug.
+        due_today_summary's cards), each summed via groupby. Because all
+        three are independent, a row's Agreed+Another + P1+P2 + Others can
+        add up to more than its own came_due whenever a lead is in both
+        Agreed+Another and P1+P2 -- that's expected, not a bug.
     Each column's sum across every TL, or every SC, still ties exactly to
     due_today_summary's own agreed_another / p1p2 / others -- a single SC's
     numbers need not resemble its own TL's row (a TL's total is itself a
     sum over several SCs), but the SUM across a whole level always matches
     the card, because group_col always partitions `came_due` exactly
     (every row has exactly one tl and one sc), so a group-by sum of the
-    same independent condition can never double-count or drop a row.
+    same independent condition can never double-count or drop a row -- the
+    0-count rows this adds don't change that identity, they just add zeros.
     """
-    cd = came_due.copy()
+    elig = eligible_pool.copy()
+    elig[group_col] = elig.get(group_col, pd.Series(dtype=str)).fillna("(unattributed)")
+    roster = pd.DataFrame({group_col: sorted(elig[group_col].unique())})
+
+    cd = came_due_pool(eligible_pool).copy()
     cd[group_col] = cd.get(group_col, pd.Series(dtype=str)).fillna("(unattributed)")
     cd["_completed"] = _is_one(cd.get("fu_completedat_today"), cd.index)
     status = cd.get("last_follow_up_status", pd.Series("", index=cd.index)).astype(str).str.strip().str.lower()
@@ -402,28 +452,34 @@ def breakdown_by(came_due: pd.DataFrame, group_col: str) -> pd.DataFrame:
     cd["_others"] = ~cd["_agreed_another"] & ~cd["_p1p2"]
 
     grp = cd.groupby(group_col)
-    out = grp.agg(came_due=("_completed", "size"), worked=("_completed", "sum")).reset_index()
-    out["worked"] = out["worked"].astype(int)
-    out["pending"] = out["came_due"] - out["worked"]
-    out["pct"] = (out["worked"] / out["came_due"] * 100).round(1)
-
+    counts = grp.agg(came_due=("_completed", "size"), worked=("_completed", "sum")).reset_index()
     agreed_counts = grp["_agreed_another"].sum().astype(int).rename("Agreed to Meet + Another follow-up")
     p1p2_counts = grp["_p1p2"].sum().astype(int).rename("P1+P2")
     others_counts = grp["_others"].sum().astype(int).rename("Others")
-    out = (out.merge(agreed_counts, on=group_col, how="left")
-              .merge(p1p2_counts, on=group_col, how="left")
-              .merge(others_counts, on=group_col, how="left"))
+    counts = (counts.merge(agreed_counts, on=group_col, how="left")
+                     .merge(p1p2_counts, on=group_col, how="left")
+                     .merge(others_counts, on=group_col, how="left"))
+
+    out = roster.merge(counts, on=group_col, how="left").fillna(0)
+    for c in ("came_due", "worked", "Agreed to Meet + Another follow-up", "P1+P2", "Others"):
+        out[c] = out[c].astype(int)
+    out["pending"] = out["came_due"] - out["worked"]
+    out["pct"] = out.apply(
+        lambda r: round(r["worked"] / r["came_due"] * 100, 1) if r["came_due"] else 0.0, axis=1,
+    )
+    out = out[[group_col, "came_due", "worked", "pending", "pct",
+               "Agreed to Meet + Another follow-up", "P1+P2", "Others"]]
 
     out = out.sort_values("pending", ascending=False).reset_index(drop=True)
     return out
 
 
-def tl_breakdown(came_due: pd.DataFrame) -> pd.DataFrame:
-    return breakdown_by(came_due, "tl")
+def tl_breakdown(eligible_pool: pd.DataFrame) -> pd.DataFrame:
+    return breakdown_by(eligible_pool, "tl")
 
 
-def sc_breakdown(came_due: pd.DataFrame, tl_name: str) -> pd.DataFrame:
-    subset = came_due[came_due.get("tl", pd.Series(dtype=str)).fillna("(unattributed)") == tl_name]
+def sc_breakdown(eligible_pool: pd.DataFrame, tl_name: str) -> pd.DataFrame:
+    subset = eligible_pool[eligible_pool.get("tl", pd.Series(dtype=str)).fillna("(unattributed)") == tl_name]
     return breakdown_by(subset, "sc")
 
 
@@ -432,20 +488,22 @@ def lead_table(came_due: pd.DataFrame, tl_name: str | None = None,
     """
     Lead-level table for the Due Today drill-down, columns:
     Lead ID, Category (the lead's own raw value -- see category_display),
-    Meeting done (first_meeting_done_date), Priority, Audio
-    (audio_duration_sec), Missing (dispositions_missing), FUs done
+    Meeting done (first_meeting_done_date), Priority, Audio Duration
+    (in sec) (audio_duration_sec), Missing (dispositions_missing), FUs done
     (total_followup_done), Last FU (last_follow_up_date), Due
     (followup_due_date), State (constant "Due Today"). No Outcome column.
     Sorted by Category: agreed_to_meet first, then
     another_follow_up_required, then P1+P2, then everything else (Others).
 
     Due isn't always today even though every row here is "due today" by
-    fu_due_date_today: that flag (see data_pull.apply_end_date_flags) looks
-    at FU1..FU6's own due dates, while followup_due_date is the lead's
-    current open task's due date (or a computed default) -- the two can
-    disagree, most often for leads past their 6th follow-up. This column
-    shows followup_due_date as-is rather than papering over that gap with
-    today's date.
+    fu_due_date_today -- that flag (see data_pull.apply_end_date_flags) now
+    also checks followup_due_date == as_of directly, so the two agree far
+    more often than before, but not always: a lead can still reach
+    came_due_pool via its FU1..FU6 due dates matching as_of while its
+    current open task (followup_due_date) has since moved to a different
+    date (e.g. the matching follow-up was rescheduled after the fact).
+    This column shows followup_due_date as-is, so that narrower remaining
+    gap can still show up here.
     """
     subset = came_due.copy()
     if tl_name:
@@ -461,7 +519,7 @@ def lead_table(came_due: pd.DataFrame, tl_name: str | None = None,
         "Category": subset["_category"],
         "Meeting done": subset.get("first_meeting_done_date"),
         "Priority": subset.get("priority"),
-        "Audio": subset.get("audio_duration_sec"),
+        "Audio Duration (in sec)": subset.get("audio_duration_sec"),
         "Missing": subset.get("dispositions_missing"),
         "FUs done": subset.get("total_followup_done"),
         "Last FU": subset.get("last_follow_up_date"),
@@ -519,30 +577,59 @@ def _ageing_bucket_from_days(days) -> str:
     return "Over 5 days"
 
 
-def overdue_summary(df: pd.DataFrame) -> dict:
+def overdue_summary(df: pd.DataFrame, as_of: str) -> dict:
     """
-    df must already be cluster-filtered. Computes the Overdue section's
-    headline numbers, all within/against the Eligible-for-follow-ups corpus
-    (see overdue_corpus_pool):
-      - pct_overdue: overdue count (funnel_bucket == 'overdue') / corpus
-        count, matching the section-card %.
+    df must already be cluster-filtered. as_of is the dashboard's single
+    "today" (the data's end date -- see data_pull.apply_end_date_flags),
+    same value passed to every other date-comparison function. Computes
+    the Overdue section's headline numbers, all within/against the
+    Eligible-for-follow-ups corpus (see overdue_corpus_pool):
       - top_overdue_tl / top_overdue_count: the TL with the most overdue
         leads (a plain count, not net of anything).
       - under_3_days / three_to_five_days / over_5_days: the ageing split
         of overdue_days within the overdue pool.
-      - agreed_another / p1p2 / others: all three are independent per-lead
-        conditions within the overdue pool. Others = ~Agreed+Another AND
-        ~P1+P2 -- checked against status first, then priority for what's
-        left, same as Due Today's cards. **[FIX]** -- Others used to be a
-        residual (total_overdue minus agreed_another minus p1p2), which
-        double-subtracted a lead that was both (undercounting Others for
-        that overlap); now it's counted directly like the other two.
-        Because all three are independent, agreed_another + p1p2 + others
-        can add up to more than total_overdue whenever a lead is in both
-        Agreed+Another and P1+P2 -- that's expected, not a bug. See
-        breakdown_by's docstring (Due Today section) for why independent
-        counts are what makes a TL/SC table's column sums tie back to
-        these cards -- that part still applies here.
+
+    **[FIX, major]** -- the headline card used to be a single "Overdue %"
+    (overdue count / corpus count). It's now a **Due / Worked / Booked**
+    triple, mirroring due_today_summary's cards exactly, all computed on
+    the SAME population that box covers (the whole overdue pool for the
+    top box, that outcome's leads for Agreed+Another, that priority's
+    leads for P1+P2):
+      - Due ("Overdue (as on today)"): funnel_bucket == 'overdue' within
+        the corpus (already true for every row here) -- this is the same
+        count the old total_overdue/"Total overdue leads" metric showed;
+        that separate metric is now redundant with this box's first
+        number and has been dropped.
+      - Worked ("Worked today"): of Due, last_follow_up_date == as_of.
+        **[FIX, twice]** -- this used to be fu_completedat_today == 1
+        (Due Today's own definition of "worked"), but that flag and
+        funnel_bucket == 'overdue' never co-occur in the data (see
+        logics.md §5) -- Worked today always read 0 as a result. It was
+        then briefly "last_follow_up_date is not blank" (any date at
+        all), which over-counted: a lead last followed up weeks ago still
+        has a non-blank last_follow_up_date, so that reading isn't "worked
+        TODAY" at all. Checking the date actually equals as_of is what
+        "worked today" means.
+      - Booked ("Booked today"): order_closure_datetime_ist is not blank,
+        out of Due -- independent of Worked, not nested inside it, same
+        [FIX] as due_today_summary's Booked (see its docstring). This is
+        NOT "of Worked, booked" -- it's "of the whole Overdue-as-on-today
+        pool (or that category's subset), booked", regardless of whether
+        that same lead also counts as Worked.
+    pct_overdue (overdue / corpus, the OLD headline %) is still returned,
+    unused by the card now but still what the TL/SC table's own "Overdue %"
+    column ratio is based on (see overdue_breakdown_by) -- not removed.
+
+    agreed_another / p1p2 / others are now also Due/Worked/Booked triples,
+    same independent-condition convention as before (Others =
+    ~Agreed+Another AND ~P1+P2, checked against status first, then
+    priority for what's left) plus their own Worked/Booked counts, exactly
+    like due_today_summary's per-category boxes (Booked independent of
+    Worked there too). Because all three are independent, Agreed+Another +
+    P1+P2 + Others (on any of the three Due/Worked/Booked numbers) can add
+    up to more than the top box's own total whenever a lead is in both
+    Agreed+Another and P1+P2 -- expected, not a bug (see
+    due_today_summary's docstring for the full reasoning).
     """
     corpus = overdue_corpus_pool(df)
     fb = _funnel_bucket_series(corpus)
@@ -567,6 +654,15 @@ def overdue_summary(df: pd.DataFrame) -> dict:
     three_to_five_pct = (three_to_five / total_overdue * 100) if total_overdue else 0.0
     over_5_pct = (over_5 / total_overdue * 100) if total_overdue else 0.0
 
+    completed_mask = (
+        od.get("last_follow_up_date", pd.Series("", index=od.index)).astype(str).str.strip() == str(as_of).strip()
+    )
+    completed_count = int(completed_mask.sum())
+    order_closure_filled = (
+        od.get("order_closure_datetime_ist", pd.Series("", index=od.index)).astype(str).str.strip() != ""
+    )
+    booked_count = int(order_closure_filled.sum())
+
     status = od.get("last_follow_up_status", pd.Series("", index=od.index)).astype(str).str.strip().str.lower()
     status_mask = status.isin(AGREED_OUTCOMES)
     agreed_another = int(status_mask.sum())
@@ -575,7 +671,19 @@ def overdue_summary(df: pd.DataFrame) -> dict:
     priority_mask = priority.isin(HIGH_PRIORITY)
     p1p2 = int(priority_mask.sum())
 
-    others = int((~status_mask & ~priority_mask).sum())
+    others_mask = ~status_mask & ~priority_mask
+    others = int(others_mask.sum())
+
+    agreed_another_completed = int((status_mask & completed_mask).sum())
+    agreed_another_booked = int((status_mask & order_closure_filled).sum())
+    p1p2_completed = int((priority_mask & completed_mask).sum())
+    p1p2_booked = int((priority_mask & order_closure_filled).sum())
+    others_completed = int((others_mask & completed_mask).sum())
+    others_booked = int((others_mask & order_closure_filled).sum())
+
+    agreed_another_pct = (agreed_another_completed / agreed_another * 100) if agreed_another else 0.0
+    p1p2_pct = (p1p2_completed / p1p2 * 100) if p1p2 else 0.0
+    others_pct = (others_completed / others * 100) if others else 0.0
 
     return {
         "total_overdue": total_overdue,
@@ -583,6 +691,8 @@ def overdue_summary(df: pd.DataFrame) -> dict:
         "pct_overdue": pct_overdue,
         "top_overdue_tl": top_overdue_tl,
         "top_overdue_count": top_overdue_count,
+        "completed_count": completed_count,
+        "booked_count": booked_count,
         "under_3_days": under_3,
         "three_to_five_days": three_to_five,
         "over_5_days": over_5,
@@ -590,8 +700,17 @@ def overdue_summary(df: pd.DataFrame) -> dict:
         "three_to_five_days_pct": three_to_five_pct,
         "over_5_days_pct": over_5_pct,
         "agreed_another": agreed_another,
+        "agreed_another_completed": agreed_another_completed,
+        "agreed_another_booked": agreed_another_booked,
+        "agreed_another_pct": agreed_another_pct,
         "p1p2": p1p2,
+        "p1p2_completed": p1p2_completed,
+        "p1p2_booked": p1p2_booked,
+        "p1p2_pct": p1p2_pct,
         "others": others,
+        "others_completed": others_completed,
+        "others_booked": others_booked,
+        "others_pct": others_pct,
     }
 
 
@@ -604,6 +723,14 @@ def overdue_breakdown_by(cluster_df: pd.DataFrame, group_col: str,
     the Agreed+Another / P1+P2 / Others split, and the Under 3 / 3-5 /
     Over 5 days ageing split.
 
+    Every TL (and, within a TL, every SC) present anywhere in the Eligible
+    corpus gets a row -- including one with zero overdue leads, shown as a
+    row of zeros rather than being absent. **[FIX]** -- this used to seed
+    rows only from the overdue-only subset, so a TL/SC with no overdue
+    lead never appeared in this table at all, even though they might have
+    plenty of other Eligible-for-follow-ups leads just not overdue (same
+    bug, and same fix, as Due Today's breakdown_by).
+
     Agreed+Another / P1+P2 / Others are all independent per-lead
     conditions, same convention as overdue_summary's cards: a lead in both
     Agreed+Another and P1+P2 is counted in both columns, and Others =
@@ -614,9 +741,10 @@ def overdue_breakdown_by(cluster_df: pd.DataFrame, group_col: str,
     P1+P2 -- that's expected, not a bug (see overdue_summary's docstring).
     Each column's sum across every TL (or every SC) still ties back to the
     summary card's own total for that column -- see breakdown_by's
-    docstring for the underlying reason (grouping always partitions
-    `came_due`/the overdue pool exactly, so a group-by sum of the same
-    independent condition can never double-count or drop a row).
+    docstring for the underlying reason (grouping always partitions the
+    corpus exactly, so a group-by sum of the same independent condition
+    can never double-count or drop a row -- the zero-count rows this adds
+    don't change that identity, they just add zeros).
 
     `cluster_df` must be the *full* cluster-filtered data (not just the
     overdue subset) so each group's own corpus count can be computed -- the
@@ -629,6 +757,7 @@ def overdue_breakdown_by(cluster_df: pd.DataFrame, group_col: str,
 
     corpus = overdue_corpus_pool(base).copy()
     corpus[group_col] = corpus.get(group_col, pd.Series(dtype=str)).fillna("(unattributed)")
+    roster = pd.DataFrame({group_col: sorted(corpus[group_col].unique())})
     corpus_counts = corpus.groupby(group_col).size().rename("_corpus").reset_index()
 
     fb = _funnel_bucket_series(corpus)
@@ -641,29 +770,31 @@ def overdue_breakdown_by(cluster_df: pd.DataFrame, group_col: str,
     od["_ageing"] = pd.to_numeric(od.get("overdue_days"), errors="coerce").apply(_ageing_bucket_from_days)
     od["_one"] = 1
 
-    out = od.groupby(group_col).size().rename("overdue").reset_index()
-    out = out.merge(corpus_counts, on=group_col, how="left")
-    out["_corpus"] = out["_corpus"].fillna(0)
+    overdue_counts = od.groupby(group_col).size().rename("overdue").reset_index()
+    agreed_counts = od.groupby(group_col)["_agreed_another"].sum().rename("Agreed to Meet + Another follow-up")
+    p1p2_counts = od.groupby(group_col)["_p1p2"].sum().rename("P1+P2")
+    others_counts = od.groupby(group_col)["_others"].sum().rename("Others")
+    age_pivot = od.pivot_table(
+        index=group_col, columns="_ageing", values="_one", aggfunc="size", fill_value=0,
+    ).reindex(columns=_AGEING_COLS, fill_value=0).reset_index()
+
+    out = (roster.merge(corpus_counts, on=group_col, how="left")
+                 .merge(overdue_counts, on=group_col, how="left")
+                 .merge(agreed_counts, on=group_col, how="left")
+                 .merge(p1p2_counts, on=group_col, how="left")
+                 .merge(others_counts, on=group_col, how="left")
+                 .merge(age_pivot, on=group_col, how="left")
+                 .fillna(0))
+
+    for c in ["_corpus", "overdue", "Agreed to Meet + Another follow-up", "P1+P2", "Others"] + _AGEING_COLS:
+        out[c] = out[c].astype(int)
+
     out["overdue_pct"] = out.apply(
         lambda r: round(r["overdue"] / r["_corpus"] * 100, 1) if r["_corpus"] else 0.0, axis=1
     )
     out = out.drop(columns=["_corpus"])
-
-    agreed_counts = od.groupby(group_col)["_agreed_another"].sum().rename("Agreed to Meet + Another follow-up")
-    p1p2_counts = od.groupby(group_col)["_p1p2"].sum().rename("P1+P2")
-    others_counts = od.groupby(group_col)["_others"].sum().rename("Others")
-    out = (out.merge(agreed_counts, on=group_col, how="left")
-              .merge(p1p2_counts, on=group_col, how="left")
-              .merge(others_counts, on=group_col, how="left").fillna(0))
-    for c in ("Agreed to Meet + Another follow-up", "P1+P2", "Others"):
-        out[c] = out[c].astype(int)
-
-    age_pivot = od.pivot_table(
-        index=group_col, columns="_ageing", values="_one", aggfunc="size", fill_value=0,
-    ).reindex(columns=_AGEING_COLS, fill_value=0).reset_index()
-    out = out.merge(age_pivot, on=group_col, how="left").fillna(0)
-    for c in _AGEING_COLS:
-        out[c] = out[c].astype(int)
+    out = out[[group_col, "overdue", "overdue_pct", "Agreed to Meet + Another follow-up", "P1+P2", "Others"]
+              + _AGEING_COLS]
 
     out = out.sort_values("overdue", ascending=False).reset_index(drop=True)
     return out
@@ -681,14 +812,22 @@ def overdue_lead_table(overdue_pool_df: pd.DataFrame, tl_name: str | None = None
                         sc_name: str | None = None) -> pd.DataFrame:
     """
     Lead-level table for the Overdue drill-down. Same Category/Priority/
-    Audio/Missing/FUs-done/Last-FU definitions as lead_table() (no Outcome
-    column, sorted by Category: agreed_to_meet first, then
-    another_follow_up_required, then P1+P2, then everything else), but:
+    Audio Duration (in sec)/Missing/FUs-done/Meeting-done/Last-FU/Due
+    definitions as lead_table() (no Outcome column, sorted by Category: agreed_to_meet
+    first, then another_follow_up_required, then P1+P2, then everything
+    else), but:
       - Category shows the lead's own raw value -- see category_display.
-      - Due: the lead's own followup_due_date (not today's date).
+      - Due: the lead's own followup_due_date (not today's date -- unlike
+        Due Today, where every row is due today by definition, an overdue
+        lead's followup_due_date is in the past).
       - Ageing: the lead's overdue_days number rendered as text, e.g. "8 days"
         (this column is named "State" in lead_table()'s Due Today output,
         but "Ageing" here per spec).
+    **[FIX]** -- Meeting done and Last FU used to be last_follow_up_date and
+    latest_status respectively (latest_status is blank for ~all leads
+    except those with more than 6 follow-up tasks). This table was missed
+    when lead_table() got the same fix, leaving the two sections
+    inconsistent; now aligned.
     """
     subset = overdue_pool_df.copy()
     if tl_name:
@@ -705,12 +844,12 @@ def overdue_lead_table(overdue_pool_df: pd.DataFrame, tl_name: str | None = None
     out = pd.DataFrame({
         "Lead ID": subset.get("lead_id"),
         "Category": subset["_category"],
-        "Meeting done": subset.get("last_follow_up_date"),
+        "Meeting done": subset.get("first_meeting_done_date"),
         "Priority": subset.get("priority"),
-        "Audio": subset.get("audio_duration_sec"),
+        "Audio Duration (in sec)": subset.get("audio_duration_sec"),
         "Missing": subset.get("dispositions_missing"),
         "FUs done": subset.get("total_followup_done"),
-        "Last FU": subset.get("latest_status"),
+        "Last FU": subset.get("last_follow_up_date"),
         "Due": subset.get("followup_due_date"),
         "Ageing": ageing,
     }).reset_index(drop=True)
@@ -752,23 +891,42 @@ def audio_index_summary(df: pd.DataFrame) -> dict:
     population).
 
     - Coverage %: count(the eligible-for-follow-ups pool -- see
-      audio_pool()), over count(is_on_spot == False).
-    - Completeness %: using that same eligible pool for both parts --
-      (pool_count * 12 - sum(dispositions_missing over the pool)) /
-      (pool_count * 12) * 100.
+      audio_pool()), over count(Meetings done AND
+      order_closure_datetime_ist is blank) -- irrespective of Closed on
+      spot / Closed on Follow-Up bucket membership; a lead's own
+      order_closure_datetime_ist value is checked directly. **[FIX]** --
+      the denominator used to be count(is_on_spot == False), which still
+      included Closed on Follow-Up leads (they aren't on-spot, but they
+      do have order_closure_datetime_ist filled in) and so overcounted the
+      denominator. Every Closed-on-spot lead has
+      order_closure_datetime_ist filled in too (confirmed against the
+      data: 0 exceptions), so this new denominator drops both closed
+      buckets cleanly and is algebraically identical to "No audio notes"
+      count + "Eligible for follow-ups" count.
+    - Completeness %: **[FIX]** -- now computed over that SAME wider
+      denominator population (No audio notes + Eligible), not just the
+      Eligible pool -- (denom_count * 11 - sum(dispositions_missing over
+      that wider population)) / (denom_count * 11) * 100. A "No audio
+      notes" lead's dispositions_missing defaults to 11 (fully missing) in
+      the source SQL, so folding those leads in pulls Completeness % down
+      substantially versus the old Eligible-only calculation -- this is
+      intentional, not a regression.
     - Audio Index: (Coverage % * Completeness %) / 1000, clipped to
       [0, 10] and rounded to 1 decimal -- same formula as the TL/SC-wise
       Index column in audio_split_breakdown().
     """
-    on_spot = _bool_series(df, "is_on_spot")
-    total_denominator = int((~on_spot).sum())
+    order_closure_blank = (
+        df.get("order_closure_datetime_ist", pd.Series("", index=df.index)).astype(str).str.strip() == ""
+    )
+    completeness_pool = df[order_closure_blank]
+    total_denominator = len(completeness_pool)
 
     pool = audio_pool(df)
     pool_count = len(pool)
     coverage_pct = (pool_count / total_denominator * 100) if total_denominator else 0.0
 
-    missing_sum = pd.to_numeric(pool.get("dispositions_missing"), errors="coerce").fillna(0).sum()
-    total_slots = pool_count * TOTAL_DISPOSITIONS
+    missing_sum = pd.to_numeric(completeness_pool.get("dispositions_missing"), errors="coerce").fillna(0).sum()
+    total_slots = total_denominator * TOTAL_DISPOSITIONS
     completeness_pct = ((total_slots - missing_sum) / total_slots * 100) if total_slots else 0.0
 
     audio_index = round(min(max(coverage_pct * completeness_pct / 1000, 0.0), 10.0), 1)
@@ -807,15 +965,20 @@ def audio_index_summary_by_city(df: pd.DataFrame) -> pd.DataFrame:
 def apply_meetings_today_filter(df: pd.DataFrame, enabled: bool, as_of: str) -> pd.DataFrame:
     """
     The Audio Index sub-section's 'From Meeting's Today' toggle: when on,
-    keeps only leads whose first_meeting_done_date == as_of (the dashboard's
-    "today" -- the data's end date, never the server clock; see
+    keeps only leads whose first_meeting_done_date == as_of (the
+    dashboard's "today" -- the data's end date, never the server clock; see
     data_pull.apply_end_date_flags). **[FIX]** -- this used to check
     fu_completedat_today == 1 (a follow-up-task flag, unrelated to when the
-    meeting itself happened); it now checks the lead's first meeting date.
+    meeting itself happened), then briefly meeting_done_date (the most
+    recent meeting activity, which can differ from the lead's first
+    meeting); it now checks first_meeting_done_date specifically.
     """
     if not enabled:
         return df
-    mask = df.get("first_meeting_done_date", pd.Series("", index=df.index)).astype(str).str.strip() == str(as_of).strip()
+    mask = (
+        df.get("first_meeting_done_date", pd.Series("", index=df.index)).astype(str).str.strip()
+        == str(as_of).strip()
+    )
     return df[mask].copy()
 
 
@@ -852,39 +1015,49 @@ def audio_split_breakdown(meeting_done_pool: pd.DataFrame, audio_base: pd.DataFr
 
     - meeting_done_pool: the full Meeting-Done population (city_df, already
       filtered by the 'From Meeting's Today' toggle if it's on). Needed
-      because the Coverage %/Completeness % denominator (is_on_spot ==
-      False) isn't restricted to audio_present == True, so it can't be
-      derived from audio_base alone.
+      because the Coverage %/Completeness % denominator (Meetings done AND
+      order_closure_datetime_ist blank -- see audio_index_summary) isn't
+      restricted to audio_present == True, so it can't be derived from
+      audio_base alone. **[FIX]** -- denominator used to be is_on_spot ==
+      False, which still included Closed on Follow-Up leads; see
+      audio_index_summary's docstring for why order_closure_datetime_ist
+      blank is the correct, narrower check (and is algebraically identical
+      to "No audio notes" + "Eligible for follow-ups" per group).
     - audio_base: meeting_done_pool narrowed to the corrected
       eligible-for-follow-ups pool (audio_pool(meeting_done_pool) --
       see eligible_for_followups_pool) -- the sub-section's actual
-      leads, used for Leads / % missing / avg missing and, via its own
-      count and dispositions_missing sum, the Coverage %/Completeness %
-      numerator for the Index.
+      leads, used for Leads / % missing / avg missing (audio_breakdown_by)
+      and, via its own count, the Coverage % numerator for the Index.
+      **[FIX]** -- Completeness % (and so the Index) is no longer computed
+      from audio_base's own dispositions_missing; it now uses the same
+      wider "order_closure_datetime_ist blank" population as the
+      denominator (see audio_index_summary's docstring for why).
     """
     md, ab = meeting_done_pool, audio_base
     if filter_col and filter_value is not None:
         md = md[md.get(filter_col, pd.Series(dtype=str)).fillna("(unattributed)") == filter_value]
         ab = ab[ab.get(filter_col, pd.Series(dtype=str)).fillna("(unattributed)") == filter_value]
 
-    on_spot = _bool_series(md, "is_on_spot")
-    denom = md[~on_spot].copy()
+    order_closure_blank = (
+        md.get("order_closure_datetime_ist", pd.Series("", index=md.index)).astype(str).str.strip() == ""
+    )
+    denom = md[order_closure_blank].copy()
     denom[group_col] = denom.get(group_col, pd.Series(dtype=str)).fillna("(unattributed)")
     denom_counts = denom.groupby(group_col).size().rename("_denom")
+    denom["_missing"] = pd.to_numeric(denom.get("dispositions_missing"), errors="coerce").fillna(0)
+    denom_missing_sum = denom.groupby(group_col)["_missing"].sum().rename("_denom_missing_sum")
 
     ab = ab.copy()
     ab[group_col] = ab.get(group_col, pd.Series(dtype=str)).fillna("(unattributed)")
     pool_counts = ab.groupby(group_col).size().rename("_pool")
-    ab["_missing"] = pd.to_numeric(ab.get("dispositions_missing"), errors="coerce").fillna(0)
-    missing_sum = ab.groupby(group_col)["_missing"].sum().rename("_missing_sum")
 
-    idx_df = pd.concat([denom_counts, pool_counts, missing_sum], axis=1).fillna(0).reset_index()
+    idx_df = pd.concat([denom_counts, denom_missing_sum, pool_counts], axis=1).fillna(0).reset_index()
     idx_df["coverage_pct"] = idx_df.apply(
         lambda r: (r["_pool"] / r["_denom"] * 100) if r["_denom"] else 0.0, axis=1,
     )
     idx_df["completeness_pct"] = idx_df.apply(
-        lambda r: ((r["_pool"] * TOTAL_DISPOSITIONS - r["_missing_sum"]) / (r["_pool"] * TOTAL_DISPOSITIONS) * 100)
-        if r["_pool"] else 0.0,
+        lambda r: ((r["_denom"] * TOTAL_DISPOSITIONS - r["_denom_missing_sum"]) / (r["_denom"] * TOTAL_DISPOSITIONS) * 100)
+        if r["_denom"] else 0.0,
         axis=1,
     )
     idx_df["index"] = (idx_df["coverage_pct"] * idx_df["completeness_pct"] / 1000).clip(lower=0, upper=10).round(1)
@@ -912,11 +1085,18 @@ def audio_lead_table(df: pd.DataFrame, tl_name: str | None = None, sc_name: str 
     Lead-level table for the Audio Index Split drill-down: Lead ID, Category,
     Meeting done, Priority, Audio Duration (in sec), Missing, FUs done,
     Last FU, Due -- same definitions as lead_table()/overdue_lead_table()
-    (Category shows the lead's own raw value, Due is the lead's
-    followup_due_date). No State/Ageing/Outcome column, per spec. Sorted by
-    Category with the same priority as Due Today/Overdue: agreed_to_meet
-    first, then another_follow_up_required, then P1+P2, then everything
-    else (Others).
+    (Category shows the lead's own raw value, Meeting done is
+    first_meeting_done_date, Last FU is last_follow_up_date, Due is the
+    lead's followup_due_date). No State/Ageing/Outcome column, per spec.
+    Sorted by Category with the same priority as Due Today/Overdue:
+    agreed_to_meet first, then another_follow_up_required, then P1+P2,
+    then everything else (Others).
+
+    **[FIX]** -- Meeting done and Last FU used to be last_follow_up_date and
+    latest_status respectively (latest_status is blank for ~all leads
+    except those with more than 6 follow-up tasks). This table was missed
+    when lead_table() got the same fix, leaving this section inconsistent
+    with Due Today; now aligned.
     """
     subset = df.copy()
     if tl_name:
@@ -930,12 +1110,12 @@ def audio_lead_table(df: pd.DataFrame, tl_name: str | None = None, sc_name: str 
     out = pd.DataFrame({
         "Lead ID": subset.get("lead_id"),
         "Category": subset["_category"],
-        "Meeting done": subset.get("last_follow_up_date"),
+        "Meeting done": subset.get("first_meeting_done_date"),
         "Priority": subset.get("priority"),
         "Audio Duration (in sec)": subset.get("audio_duration_sec"),
         "Missing": subset.get("dispositions_missing"),
         "FUs done": subset.get("total_followup_done"),
-        "Last FU": subset.get("latest_status"),
+        "Last FU": subset.get("last_follow_up_date"),
         "Due": subset.get("followup_due_date"),
     }).reset_index(drop=True)
     return _category_sort_frame(out, "Category", order=_DUE_OVERDUE_CATEGORY_SORT_ORDER)
@@ -1021,16 +1201,17 @@ def funnel_box_label(raw_status: str) -> str:
 
 def funnel_pool(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Follow-up funnel base pool (applies to every box except Booked):
-    audio_present == True AND is_on_spot == False AND
-    order_closure_datetime_ist is blank.
+    Follow-up funnel base pool (applies to every box except Booked) --
+    shared by the Funnel Quality section too (see funnel_quality_pool):
+    the same "Eligible for follow-ups" pool as Overview's Card 1 / Audio
+    Index / Overdue / Due Today -- see eligible_for_followups_pool().
+    **[FIX, major]** -- this used to be its own, separately-defined pool
+    (audio_present == True AND is_on_spot == False AND
+    order_closure_datetime_ist blank); it now shares the exact same
+    eligible-for-follow-ups pool every other section uses, so none of them
+    disagree about which leads are in scope.
     """
-    audio = _bool_series(df, "audio_present")
-    on_spot = _bool_series(df, "is_on_spot")
-    order_closure_blank = (
-        df.get("order_closure_datetime_ist", pd.Series("", index=df.index)).astype(str).str.strip() == ""
-    )
-    return df[audio & ~on_spot & order_closure_blank].copy()
+    return eligible_for_followups_pool(df)
 
 
 def booked_box_pool(df: pd.DataFrame) -> pd.DataFrame:
@@ -1171,6 +1352,11 @@ def another_fu_lead_table(pool: pd.DataFrame, as_of: str, tl_name: str | None = 
     Today (signed day count relative to as_of), Last FU (last_follow_up_date).
     Sorted most-overdue-first (no priority sort here -- unlike the Due
     Today/Overdue tables, this box has no Category column to key off of).
+
+    **[FIX]** -- City used to read a "city" column, which doesn't exist in
+    the data (always blank). "City" means the `cluster` column everywhere
+    else in this dashboard (the sidebar's own city filter is
+    filter_cluster() against `cluster`), so this now matches that.
     """
     subset = pool.copy()
     if tl_name:
@@ -1183,7 +1369,7 @@ def another_fu_lead_table(pool: pd.DataFrame, as_of: str, tl_name: str | None = 
 
     out = pd.DataFrame({
         "Lead ID": subset.get("lead_id"),
-        "City": subset.get("city"),
+        "City": subset.get("cluster"),
         "Priority": subset.get("priority"),
         "Scheduled": subset.get("next_follow_up_date"),
         "Days from Today": days_label,
@@ -1241,7 +1427,14 @@ def dnp_sc_breakdown(pool: pd.DataFrame, tl_name: str) -> pd.DataFrame:
 
 
 def dnp_lead_table(pool: pd.DataFrame, tl_name: str | None = None, sc_name: str | None = None) -> pd.DataFrame:
-    """Lead ID, City, Priority, Consecutive DNPs (tl_is_dnp_tasks), Last FU, Due (next_follow_up_date)."""
+    """
+    Lead ID, City, Priority, Consecutive DNPs (tl_is_dnp_tasks), Last FU,
+    Due (next_follow_up_date).
+
+    **[FIX]** -- City used to read a "city" column, which doesn't exist in
+    the data (always blank); now uses `cluster`, same as
+    another_fu_lead_table and the sidebar's own city filter.
+    """
     subset = pool.copy()
     if tl_name:
         subset = subset[subset.get("tl", pd.Series(dtype=str)).fillna("(unattributed)") == tl_name]
@@ -1250,7 +1443,7 @@ def dnp_lead_table(pool: pd.DataFrame, tl_name: str | None = None, sc_name: str 
 
     out = pd.DataFrame({
         "Lead ID": subset.get("lead_id"),
-        "City": subset.get("city"),
+        "City": subset.get("cluster"),
         "Priority": subset.get("priority"),
         "Consecutive DNPs": pd.to_numeric(subset.get("tl_is_dnp_tasks"), errors="coerce"),
         "Last FU": subset.get("last_follow_up_date"),
@@ -1480,15 +1673,24 @@ def _fq_is_beyond5(pool: pd.DataFrame) -> pd.Series:
     return _fq_beyond5_eligible(pool) & (diff > 5)
 
 
+def _fq_with_outcome(pool: pd.DataFrame) -> pd.Series:
+    """'With an outcome': last_follow_up_status is not blank."""
+    return _fq_status(pool) != ""
+
+
 # (key, label, mask_fn, basis_label, denominator_fn) -- the denominator for
-# category 1/2 is the whole base pool; category 3's is narrower (only the
-# leads that carry an eligible status at all), matching the reference
-# layout's own "Basis" wording.
+# category 1/2 is "With an outcome" (non-blank last_follow_up_status)
+# within the pool; category 3's is narrower still (only the leads that
+# carry an eligible status at all), matching the reference layout's own
+# "Basis" wording. **[FIX]** -- category 1/2's denominator used to be the
+# WHOLE pool (len(pool)), including blank-status leads, even though the
+# "of leads with an outcome" label text already implied only non-blank
+# ones -- the label and the number now actually agree.
 FUNNEL_QUALITY_CATEGORIES = [
     ("dnp", "Did not pick up", _fq_is_dnp,
-     "of leads with an outcome", lambda pool: len(pool)),
+     "of leads with an outcome", lambda pool: int(_fq_with_outcome(pool).sum())),
     ("dnp_lost_nurture", "Did not pick up + Lost + Nurture", _fq_is_dnp_lost_nurture,
-     "of leads with an outcome", lambda pool: len(pool)),
+     "of leads with an outcome", lambda pool: int(_fq_with_outcome(pool).sum())),
     ("beyond_5_days", "Another follow-up dated beyond 5 days", _fq_is_beyond5,
      "of follow-ups carrying a next date", lambda pool: int(_fq_beyond5_eligible(pool).sum())),
 ]
@@ -1545,6 +1747,11 @@ def funnel_quality_tl_wise(df: pd.DataFrame) -> pd.DataFrame:
     raw count of leads whose last_follow_up_status isn't blank) plus each
     category's percentage for that TL (None when its denominator is 0,
     which the display layer renders as a dash, same as a literal 0%).
+
+    dnp_pct / dnp_lost_nurture_pct are now out of that same with_outcome
+    count, not the TL's whole pool -- **[FIX]**, matching the Overall
+    cut's own Basis (see FUNNEL_QUALITY_CATEGORIES) so the two cuts use
+    the same denominator for the same category.
     """
     pool = funnel_quality_pool(df)
     tl_series = pool.get("tl", pd.Series(dtype=str)).fillna("(unattributed)")
@@ -1552,9 +1759,7 @@ def funnel_quality_tl_wise(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for tl_name in sorted(tl_series.unique()):
         sub = pool[tl_series == tl_name]
-        status = _fq_status(sub)
-        total = len(sub)
-        with_outcome = int((status != "").sum())
+        with_outcome = int(_fq_with_outcome(sub).sum())
 
         def pct(n: int, denom: int):
             return round(n / denom * 100, 1) if denom else None
@@ -1563,8 +1768,8 @@ def funnel_quality_tl_wise(df: pd.DataFrame) -> pd.DataFrame:
         rows.append({
             "tl": tl_name,
             "with_outcome": with_outcome,
-            "dnp_pct": pct(int(_fq_is_dnp(sub).sum()), total),
-            "dnp_lost_nurture_pct": pct(int(_fq_is_dnp_lost_nurture(sub).sum()), total),
+            "dnp_pct": pct(int(_fq_is_dnp(sub).sum()), with_outcome),
+            "dnp_lost_nurture_pct": pct(int(_fq_is_dnp_lost_nurture(sub).sum()), with_outcome),
             "beyond_5_days_pct": pct(int(_fq_is_beyond5(sub).sum()), eligible_total),
         })
 
